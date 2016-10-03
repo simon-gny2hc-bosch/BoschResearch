@@ -1,0 +1,770 @@
+using RBEI.MIS.SpaceManagement.DataAccess;
+using RBEI.MIS.SpaceManagement.Models;
+using RBEI.MIS.SpaceManagement.Repository.Models;
+using RBEI.MIS.SpaceManagement.Repository.Models.GenDb;
+using RBEI.MIS.SpaceManagement.Repository.Models.SlickGrid;
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Common;
+using System.Data.SqlClient;
+using System.Dynamic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace RBEI.MIS.SpaceManagement.Repository
+{
+    public interface IWorkplaceStatisticsRepository
+    {
+        IEnumerable<WorkSpaceGridItemModel> GetWorkplaces(int level, int id, string typeName);
+
+        Task<SlickGridDynamicModel> CreateWorkplaceStatisticsTreeGrid(
+            int locationId = 0,
+            int? subLocationId = null, int? buildingId = null, int? floorId = null, int? unitId = null);
+
+        Task<ResultSetModel> CalculateWorkplaceStatistics(
+            int locationId = 0,
+            int? subLocationId = null, int? buildingId = null, int? floorId = null, int? unitId = null);
+    }
+
+    public class WorkplaceStatisticsRepository : IWorkplaceStatisticsRepository
+    {
+        private SpaceManagementContext _db;
+        private IGenDbRepository _genDb;
+
+        public WorkplaceStatisticsRepository(SpaceManagementContext db)
+        {
+            this._db = db;
+            this._genDb = new GenDbRepository(db);
+        }
+
+        public async Task<SlickGridDynamicModel> CreateWorkplaceStatisticsTreeGrid(
+            int locationId = 0,
+            int? subLocationId = null, int? buildingId = null, int? floorId = null, int? unitId = null)
+        {
+            SlickGridDynamicModel slickgrid = new SlickGridDynamicModel();
+
+            var tree = new List<dynamic>();
+            int id = 0;
+            int parentId = 0;
+
+            dynamic locationStatic = null;
+            dynamic locationDynamic = null;
+            dynamic treeGridItem = null;
+
+            ResultSetModel result = await CalculateWorkplaceStatistics();
+
+            if (locationId == 0)
+            {
+                var locations = this._genDb.GetLocations();
+                foreach (var location in locations)
+                {
+                    locationStatic = new ExpandoObject();
+                    locationStatic.Id = "id_" + id.ToString();
+                    locationStatic.Indent = 0;
+                    locationStatic.Parent = null;
+
+                    locationStatic.ItemId = location.LocationID;
+                    locationStatic.Name = location.LocationName;
+                    locationStatic.Code = location.LocationCode;
+
+                    locationDynamic = result.ExpandoDataSet.SingleOrDefault(e => e.ItemId == location.LocationID);
+
+                    treeGridItem = Combine(locationStatic, locationDynamic);
+
+                    tree.Add(treeGridItem);
+
+                    var locationBranch = await PopulateLocationBranch(
+                        itemId => id = itemId, () => id,
+                        pId => parentId = pId, () => parentId,
+                        location.LocationID);
+
+                    tree.AddRange(locationBranch);
+
+                    ++id;
+                }
+            }
+            else
+            {
+                var location = _genDb.GetLocationById(locationId);
+
+                locationStatic = new ExpandoObject();
+                locationStatic.Id = "id_" + id.ToString();
+                locationStatic.Indent = 0;
+                locationStatic.Parent = null;
+
+                locationStatic.ItemId = location.LocationID;
+                locationStatic.Name = location.LocationName;
+                locationStatic.Code = location.LocationCode;
+
+                locationDynamic = result.ExpandoDataSet.SingleOrDefault(e => e.ItemId == locationId);
+                //if (locationDynamic = null)
+                //{
+                //    // There isn't any workspace in this location, we can stop calculate the workspace statistics
+                //    locationDynamic = workplaceStatisticsResult.CreateDefaultDynamicRow(
+                //        new Dictionary<string, object>
+                //        {
+                //            { "ItemId", location.LocationID },
+                //            { "Name", location.LocationName }
+                //        });
+
+                //    treeGridItem = Combine(locationStatic, locationDynamic);
+
+                //    tree.Add(treeGridItem);
+                //}
+
+                treeGridItem = Combine(locationStatic, locationDynamic);
+
+                tree.Add(treeGridItem);
+
+                var locationBranch = await PopulateLocationBranch(
+                    itemId => id = itemId, () => id,
+                    pId => parentId = pId, () => parentId,
+                    locationId,
+                    subLocationId, buildingId, floorId, unitId);
+
+                tree.AddRange(locationBranch);
+            }
+
+            var gridColumnInfos = (ICollection<KeyValuePair<string, object>>)treeGridItem;
+            var columns = gridColumnInfos.Select(kvp => new SlickGridColumnModel
+            {
+                Id = "col" + kvp.Key,
+                Name = kvp.Key,
+                Field = Char.ToLowerInvariant(kvp.Key[0]) + kvp.Key.Substring(1)
+            }).ToList();
+
+            for (int i = columns.Count - 1; i >= columns.Count - result.DynamicColumnCount; --i)
+            {
+                columns[i].IsDynamic = true;
+                // TODO: update Stored Procedure for the name
+                //columns[i].DynamicName = kvp.Key;
+            }
+
+            slickgrid.GridColumns = columns;
+            slickgrid.TreeData = tree;
+
+            return slickgrid;
+        }
+
+        public IEnumerable<WorkSpaceGridItemModel> GetWorkplaces(int level, int id, string typeName)
+        {
+            var workspaceTypeId = (from wst in _db.WorkSpaceTypes
+                                   where wst.Name.Equals(typeName, StringComparison.Ordinal)
+                                   select wst.TypeID).SingleOrDefault();
+
+            List<WorkSpace> wss = null;
+
+            switch (level)
+            {
+                case 0:
+                    wss = (from l in _genDb.GetLocations()
+                           from sl in _genDb.GetSubLocations(l.LocationID)
+                           from b in _genDb.GetBuildings(sl.SubLocationID)
+                           from f in _genDb.GetFloors(b.BuildingID)
+                           from w in _genDb.GetWings(f.FloorID)
+                           from ws in _db.WorkSpaces
+                           where ws.WingID == w.WingID && ws.WorkspaceTypeID == workspaceTypeId && !ws.DeleteFlg
+                           select ws).ToList();
+                    break;
+                case 1:
+                    wss = (from sl in _genDb.GetSubLocations()
+                           from b in _genDb.GetBuildings(sl.SubLocationID)
+                           from f in _genDb.GetFloors(b.BuildingID)
+                           from w in _genDb.GetWings(f.FloorID)
+                           from ws in _db.WorkSpaces
+                           where ws.WingID == w.WingID && ws.WorkspaceTypeID == workspaceTypeId && !ws.DeleteFlg
+                           select ws).ToList();
+
+                    break;
+                case 2:
+                    wss = (from b in _genDb.GetBuildings()
+                           from f in _genDb.GetFloors(b.BuildingID)
+                           from w in _genDb.GetWings(f.FloorID)
+                           from ws in _db.WorkSpaces
+                           where ws.WingID == w.WingID && ws.WorkspaceTypeID == workspaceTypeId && !ws.DeleteFlg
+                           select ws).ToList();
+                    break;
+                case 3:
+                    wss = (from f in _genDb.GetFloors()
+                           from w in _genDb.GetWings(f.FloorID)
+                           from ws in _db.WorkSpaces
+                           where ws.WingID == w.WingID && ws.WorkspaceTypeID == workspaceTypeId && !ws.DeleteFlg
+                           select ws).ToList();
+
+                    //workspaces = await(from u in _dbContext.Units
+                    //                   join ws in _dbContext.Workspaces on u.Id equals ws.UnitId
+                    //                   where u.Id == id && !ws.IsDeleted && ws.WorkspaceTypeId == workspaceTypeId
+                    //                   select ws).ToListAsync();
+                    break;
+                case 4:
+                    wss = (from w in _genDb.GetWings()
+                           from ws in _db.WorkSpaces
+                           where ws.WingID == w.WingID && ws.WorkspaceTypeID == workspaceTypeId && !ws.DeleteFlg
+                           select ws).ToList();
+                    break;
+                default:
+                    break;
+            }
+
+            List<WorkSpaceGridItemModel> workspaces = wss.Select((ws, index) => new WorkSpaceGridItemModel
+            {
+                id = "id_" + index.ToString(),
+                WorkspaceId = ws.WorkspaceID,
+                Name = ws.Name,
+                Code = ws.Code,
+                CreatedDate = ws.CreatedDate.ToString("dd-MMM-yyyy hh:mm"),
+                UpdatedDate = ws.ModifiedDate.ToString("dd-MMM-yyyy hh:mm"),
+                IsDeleted = ws.IsDeleted
+            }).ToList();
+
+            return workspaces;
+        }
+
+        public async Task<IEnumerable<dynamic>> PopulateLocationBranch(
+            Action<int> setId, Func<int> getId,
+            Action<int> setParentId, Func<int> getParentId,
+            int locationId,
+            int? subLocationId = null, int ? buildingId = null, int? floorId = null, int? unitId = null)
+        {
+            var locationBranch = new List<dynamic>();
+            int id = getId();
+
+            dynamic subLocationStatic = null;
+            dynamic subLocationDynamic = null;
+            dynamic treeGridItem = null;
+
+            // calculates all Sub-Locations
+            ResultSetModel result = await CalculateWorkplaceStatistics(locationId, 0);
+
+            if (!subLocationId.HasValue || subLocationId.Value == 0)
+            {
+                var subLocations = _genDb.GetSubLocations(locationId);
+                if (subLocations.Count > 0)
+                {
+                    setParentId(id); // parentId = id
+                    int parent = getParentId();
+
+                    foreach (var subLocation in subLocations)
+                    {
+                        subLocationStatic = new ExpandoObject();
+                        subLocationStatic.Id = "id_" + (++id).ToString();
+                        subLocationStatic.Indent = 1;
+                        subLocationStatic.Parent = parent;
+
+                        subLocationStatic.ItemId = subLocation.SubLocationID;
+                        subLocationStatic.Name = subLocation.SubLocationName;
+                        subLocationStatic.Code = subLocation.SubLocationCode;
+
+                        subLocationDynamic = result.ExpandoDataSet.SingleOrDefault(e => e.ItemId == subLocation.SubLocationID);
+
+                        treeGridItem = Combine(subLocationStatic, subLocationDynamic);
+
+                        locationBranch.Add(treeGridItem);
+
+                        setId(id); // updates ID increment
+
+                        var subLocationBranch = await PopulateSubLocationBranch(
+                            setId, getId,
+                            setParentId, getParentId,
+                            locationId,
+                            subLocation.SubLocationID);
+
+                        locationBranch.AddRange(subLocationBranch);
+
+                        // makes sure the ID is continuous after populating the children.
+                        id = getId();
+                    }
+                }
+            }
+            else
+            {
+                // locationId > 0 && subLocationId > 0 (it shouldn't be NULL, should it?)
+                var subLocation = _genDb.GetSubLocationById(subLocationId.Value);
+
+                subLocationStatic = new ExpandoObject();
+                subLocationStatic.Id = "id_" + (++id).ToString();
+                subLocationStatic.Indent = 1;
+                subLocationStatic.Parent = getParentId();
+
+                subLocationStatic.ItemId = subLocation.SubLocationID;
+                subLocationStatic.Name = subLocation.SubLocationName;
+                subLocationStatic.Code = subLocation.SubLocationCode;
+
+                subLocationDynamic = result.ExpandoDataSet.SingleOrDefault(e => e.ItemId == subLocationId.Value);
+
+                treeGridItem = Combine(subLocationStatic, subLocationDynamic);
+
+                setId(id); // updates ID increment
+                setParentId(id); // parentId = id
+
+                locationBranch.Add(treeGridItem);
+
+                var subLocationBranch = await PopulateSubLocationBranch(
+                    setId, getId,
+                    setParentId, getParentId,
+                    locationId,
+                    subLocationId.Value,
+                    buildingId, floorId, unitId);
+
+                locationBranch.AddRange(subLocationBranch);
+
+                // makes sure the ID is continuous after populating the children.
+                id = getId();
+            }
+
+            return locationBranch;
+        }
+        
+        public async Task<IEnumerable<dynamic>> PopulateSubLocationBranch(
+            Action<int> setId, Func<int> getId,
+            Action<int> setParentId, Func<int> getParentId,
+            int locationId, int subLocationId,
+            int? buildingId = null, int? floorId = null, int? wingId = null)
+        {
+            var subLocationBranch = new List<dynamic>();
+            int id = getId();
+
+            dynamic buildingStatic = null;
+            dynamic buildingDynamic = null;
+            dynamic treeGridItem = null;
+
+            // calculates all Buildings
+            ResultSetModel result = await CalculateWorkplaceStatistics(locationId, subLocationId, 0);
+
+            if (!buildingId.HasValue || buildingId.Value == 0)
+            {
+                var buildings = _genDb.GetBuildings(subLocationId);
+                if (buildings.Count > 0)
+                {
+                    setParentId(id); // parentId = id
+                    int parent = getParentId();
+
+                    foreach (var building in buildings)
+                    {
+                        buildingStatic = new ExpandoObject();
+                        buildingStatic.Id = "id_" + (++id).ToString();
+                        buildingStatic.Indent = 2;
+                        buildingStatic.Parent = parent;
+
+                        buildingStatic.ItemId = building.BuildingID;
+                        buildingStatic.Name = building.BuildingName;
+                        buildingStatic.Code = building.BuildingCode;
+
+                        buildingDynamic = result.ExpandoDataSet.SingleOrDefault(e => e.ItemId == building.BuildingID);
+
+                        treeGridItem = Combine(buildingStatic, buildingDynamic);
+
+                        setId(id); // updates ID increment
+
+                        subLocationBranch.Add(treeGridItem);
+
+                        var buildingBranch = await PopulateBuildingBranch(
+                            setId, getId,
+                            setParentId, getParentId,
+                            locationId, subLocationId, building.BuildingID);
+
+                        subLocationBranch.AddRange(buildingBranch);
+
+                        // makes sure the ID is continuous after populating the children.
+                        id = getId();
+                    }
+                }
+            }
+            else
+            {
+                // locationId > 0 && subLocationId && buildingId > 0
+                var building = _genDb.GetBuildingById(buildingId.Value); // it shouldn't be NULL, should it?
+                buildingStatic = new ExpandoObject();
+                buildingStatic.Id = "id_" + (++id).ToString();
+                buildingStatic.Indent = 2;
+                buildingStatic.Parent = getParentId();
+
+                buildingStatic.ItemId = building.BuildingID;
+                buildingStatic.Name = building.BuildingName;
+                buildingStatic.Code = building.BuildingCode;
+
+                buildingDynamic = result.ExpandoDataSet.SingleOrDefault(e => e.ItemId == buildingId.Value);
+
+                treeGridItem = Combine(buildingStatic, buildingDynamic);
+
+                setParentId(id);
+                setId(id); // updates ID increment
+
+                subLocationBranch.Add(treeGridItem);
+
+                var buildingBranch = await PopulateBuildingBranch(
+                    setId, getId,
+                    setParentId, getParentId,
+                    locationId, subLocationId, buildingId.Value,
+                    floorId, wingId);
+
+                subLocationBranch.AddRange(buildingBranch);
+
+                // makes sure the ID is continuous after populating the children.
+                id = getId();
+            }
+
+            return subLocationBranch;
+        }
+
+        public async Task<IEnumerable<dynamic>> PopulateBuildingBranch(
+            Action<int> setId, Func<int> getId,
+            Action<int> setParentId, Func<int> getParentId,
+            int locationId, int subLocationId, int buildingId,
+            int? floorId = null, int? wingId = null)
+        {
+            var buildingBranch = new List<dynamic>();
+            int id = getId();
+
+            dynamic floorStatic = null;
+            dynamic floorDynamic = null;
+            dynamic treeGridItem = null;
+
+            // calculates all Floors
+            ResultSetModel result = await CalculateWorkplaceStatistics(locationId, subLocationId, buildingId, 0);
+
+            if (!floorId.HasValue || floorId.Value == 0)
+            {
+                var floors = _genDb.GetFloors(buildingId);
+                if (floors.Count > 0)
+                {
+                    setParentId(id); // parentId = id
+                    int parent = getParentId();
+
+                    foreach (var floor in floors)
+                    {
+                        floorStatic = new ExpandoObject();
+                        floorStatic.Id = "id_" + (++id).ToString();
+                        floorStatic.Indent = 3;
+                        floorStatic.Parent = parent;
+
+                        floorStatic.ItemId = floor.FloorID;
+                        floorStatic.Name = floor.FloorName;
+                        floorStatic.Code = floor.FloorCode;
+
+                        floorDynamic = result.ExpandoDataSet.SingleOrDefault(e => e.ItemId == floor.FloorID);
+
+                        treeGridItem = Combine(floorStatic, floorDynamic);
+
+                        setId(id); // updates ID increment
+
+                        buildingBranch.Add(treeGridItem);
+
+                        var floorBranch = await PopulateFloorBranch(
+                            setId, getId,
+                            setParentId, getParentId,
+                            locationId, subLocationId, buildingId, floor.FloorID);
+
+                        buildingBranch.AddRange(floorBranch);
+
+                        // makes sure the ID is continuous after populating the children.
+                        id = getId();
+                    }
+                }
+            }
+            else
+            {
+                // locationId > 0 && subLocationId && buildingId > 0 && floorId > 0
+                var floor = _genDb.GetFloorById(floorId.Value); // it shouldn't be NULL, should it?
+                floorStatic = new ExpandoObject();
+                floorStatic.Id = "id_" + (++id).ToString();
+                floorStatic.Indent = 3;
+                floorStatic.Parent = getParentId();
+
+                floorStatic.ItemId = floor.FloorID;
+                floorStatic.Name = floor.FloorName;
+                floorStatic.Code = floor.FloorCode;
+
+                //ResultSetModel result = await CalculateWorkplaceStatistics(locationId, subLocationId, buildingId, floorId.Value);
+
+                floorDynamic = result.ExpandoDataSet.SingleOrDefault(e => e.ItemId == floorId.Value);
+
+                treeGridItem = Combine(floorStatic, floorDynamic);
+                buildingBranch.Add(treeGridItem);
+
+                setParentId(id);
+                setId(id); // updates ID increment
+
+                var floorBranch = await PopulateFloorBranch(
+                    setId, getId,
+                    setParentId, getParentId,
+                    locationId, subLocationId, buildingId, floorId.Value,
+                    wingId);
+
+                buildingBranch.AddRange(floorBranch);
+
+                // makes sure the ID is continuous after populating the children.
+                id = getId();
+            }
+
+            return buildingBranch;
+        }
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="setId"></param>
+        /// <param name="getId"></param>
+        /// <param name="setParentId"></param>
+        /// <param name="getParentId"></param>
+        /// <param name="locationId"></param>
+        /// <param name="subLocationId"></param>
+        /// <param name="buildingId"></param>
+        /// <param name="floorId"></param>
+        /// <param name="wingId"></param>
+        /// <returns></returns>
+        public async Task<IEnumerable<dynamic>> PopulateFloorBranch(
+            Action<int> setId, Func<int> getId,
+            Action<int> setParentId, Func<int> getParentId,
+            int locationId, int subLocationId, int buildingId, int floorId,
+            int? wingId = null)
+        {
+            var floorBranch = new List<dynamic>();
+            int id = getId();
+
+            dynamic wingStatic = null;
+            dynamic wingDynamic = null;
+            dynamic treeGridItem = null;
+
+            // calculates all Wings
+            ResultSetModel result = await CalculateWorkplaceStatistics(locationId, subLocationId, buildingId, floorId, 0);
+
+            if (!wingId.HasValue || wingId.Value == 0)
+            {
+                var wings = _genDb.GetWings(floorId);
+                if (wings.Count > 0)
+                {
+                    setParentId(id); // parentId = id
+                    int parent = getParentId();
+
+                    // calculates all Wings
+                    //ResultSetModel result = await CalculateWorkplaceStatistics(locationId, subLocationId, buildingId, floorId, 0);
+
+                    foreach (var wing in wings)
+                    {
+                        wingStatic = new ExpandoObject();
+                        wingStatic.Id = "id_" + (++id).ToString();
+                        wingStatic.Indent = 4;
+                        wingStatic.Parent = parent;
+
+                        wingStatic.ItemId = wing.WingID;
+                        wingStatic.Name = wing.WingName;
+                        wingStatic.Code = wing.WingCode;
+
+                        wingDynamic = result.ExpandoDataSet.SingleOrDefault(e => e.ItemId == wing.WingID);
+
+                        treeGridItem = Combine(wingStatic, wingDynamic);
+
+                        floorBranch.Add(treeGridItem);
+
+                        setId(id); // updates ID increment
+                    }
+                }
+            }
+            else
+            {
+                //setParentId(id);
+
+                // locationId > 0 && subLocationId > 0 && buildingId > 0 && floorId > 0 && wingId > 0
+                var wing = _genDb.GetWingById(wingId.Value); // it shouldn't be NULL, should it?
+
+                wingStatic = new ExpandoObject();
+                wingStatic.Id = "id_" + (++id).ToString();
+                wingStatic.Indent = 4;
+                wingStatic.Parent = getParentId();
+
+                wingStatic.ItemId = wing.WingID;
+                wingStatic.Name = wing.WingName;
+                wingStatic.Code = wing.WingCode;
+
+                //ResultSetModel result = await CalculateWorkplaceStatistics(locationId, subLocationId, buildingId, floorId, wingId.Value);
+
+                wingDynamic = result.ExpandoDataSet.SingleOrDefault(e => e.ItemId == wingId.Value);
+
+                treeGridItem = Combine(wingStatic, wingDynamic);
+
+                floorBranch.Add(treeGridItem);
+
+                setId(id); // updates ID increment
+            }
+
+            return floorBranch;
+        }
+
+        public async Task<ResultSetModel> CalculateWorkplaceStatistics(int locationId = 0,
+            int? subLocationId = null, int? buildingId = null, int? floorId = null, int? wingId = null)
+        {
+            ResultSetModel resultSet = new ResultSetModel(staticColumnCount: 2);
+
+            using (var command = _db.Database.Connection.CreateCommand())
+            {
+                command.CommandText = "[SM].[USP_Calculate_Workplace_Statistics]";
+                command.CommandType = CommandType.StoredProcedure;
+
+                var parameters = PrepareParameters(locationId, subLocationId, buildingId, floorId, wingId);
+                if (parameters.Any())
+                {
+                    command.Parameters.AddRange(parameters);
+                }
+
+                try
+                {
+                    _db.Database.Connection.Open();
+
+                    // the result will be a DataTable with ID, Name as static fields and others are dynamic ones.
+                    using (var reader = await command.ExecuteReaderAsync())
+                    {
+                        if (reader.FieldCount > 0)
+                        {
+                            // gets list of column names from the DbDataReader ONCE.
+                            //resultSet.Columns = Enumerable.Range(0, reader.FieldCount).Select(reader.GetName).ToList();
+                            //if (getColumnInfos)
+                            //{
+                                resultSet.ColumnInfos = Enumerable
+                                    .Range(0, reader.FieldCount)
+                                    .ToDictionary(
+                                        i => reader.GetName(i),
+                                        i => reader.GetFieldType(i));
+
+                                resultSet.DynamicColumnCount = reader.FieldCount - resultSet.StaticColumnCount;
+                            //}
+
+
+                            if (reader.HasRows)
+                            {
+                                while (await reader.ReadAsync())
+                                {
+                                    var set = Enumerable.Range(0, reader.FieldCount)
+                                   .ToDictionary(
+                                       i => reader.GetName(i),
+                                       i => reader.GetValue(i));
+
+                                    var expando = new ExpandoObject();
+                                    var expandoSet = (ICollection<KeyValuePair<string, object>>)expando;
+                                    foreach (var kvp in set)
+                                    {
+                                        expandoSet.Add(kvp);
+                                    }
+
+                                    dynamic dexpando = expandoSet;
+
+                                    resultSet.ExpandoDataSet.Add(expandoSet);
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    throw ex;
+                }
+                finally
+                {
+                    _db.Database.Connection.Close();
+                }
+            }
+
+            return resultSet;
+        }
+
+        private static dynamic Combine(dynamic item1, dynamic item2)
+        {
+            var dictionary1 = (IDictionary<string, object>)item1;
+            var dictionary2 = (IDictionary<string, object>)item2;
+
+            var result = new ExpandoObject();
+            var d = result as IDictionary<string, object>; //work with the Expando as a Dictionary
+
+            foreach (var pair in dictionary1.Concat(dictionary2))
+            {
+                d[pair.Key] = pair.Value;
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Prepares the parameters for the <c>[SM].[USP_Calculate_Workplace_Statistics]</c>.
+        /// </summary>
+        /// <param name="locationId"></param>
+        /// <param name="subLocationId"></param>
+        /// <param name="buildingId"></param>
+        /// <param name="floorId"></param>
+        /// <param name="wingId"></param>
+        /// <returns>An array of paramters otherwise empty.</returns>
+        /// <remarks>
+        /// The <c>[SM].[USP_Calculate_Workplace_Statistics]</c> was defined/created
+        /// with parameters that have default value.
+        /// <code>
+        ///     @LocationID INT = 0, --OR 6520,
+        ///     @SubLocationID INT = NULL, --OR 1,
+        ///     @BuildingID INT = NULL, --OR 2,
+        ///     @FloorID INT = NULL, --OR 2,
+        ///     @WingID INT = NULL--OR 1 OR 2
+        /// </code>
+        /// </remarks>
+        private static DbParameter[] PrepareParameters(int locationId = 0,
+            int? subLocationId = null, int? buildingId = null, int? floorId = null, int? wingId = null)
+        {
+            var parameters = new List<SqlParameter>();
+
+            if (locationId > 0)
+            {
+                if (subLocationId.HasValue && subLocationId.Value >= 0)
+                {
+                    if (buildingId.HasValue && buildingId.Value >= 0)
+                    {
+                        if (floorId.HasValue && floorId.Value >= 0)
+                        {
+                            if (wingId.HasValue && wingId.Value >= 0)
+                            {
+                                parameters.Add(new SqlParameter
+                                {
+                                    Direction = ParameterDirection.Input,
+                                    ParameterName = "@WingID",
+                                    SqlDbType = SqlDbType.Int,
+                                    Value = wingId.Value
+                                });
+                            }
+
+                            parameters.Add(new SqlParameter
+                            {
+                                Direction = ParameterDirection.Input,
+                                ParameterName = "@FloorID",
+                                SqlDbType = SqlDbType.Int,
+                                Value = floorId.Value
+                            });
+                        }
+
+                        parameters.Add(new SqlParameter
+                        {
+                            Direction = ParameterDirection.Input,
+                            ParameterName = "@BuildingID",
+                            SqlDbType = SqlDbType.Int,
+                            Value = buildingId.Value
+                        });
+                    }
+
+                    parameters.Add(new SqlParameter
+                    {
+                        Direction = ParameterDirection.Input,
+                        ParameterName = "@SubLocationID",
+                        SqlDbType = SqlDbType.Int,
+                        Value = subLocationId.Value
+                    });
+                }
+
+                parameters.Add(new SqlParameter
+                {
+                    Direction = ParameterDirection.Input,
+                    ParameterName = "@LocationID",
+                    SqlDbType = SqlDbType.Int,
+                    Value = locationId
+                });
+            }
+
+            return parameters.ToArray();
+        }
+    }
+}
